@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OwlFlow Automation Engine deployed as a serverless container image on AWS Lambda
+  using the AWS Lambda Web Adapter with public or IAM-authenticated Function URL ingress.
+
+# ==============================================================================
+# Metadata & Parameter Groups
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - EnvironmentName
+          - ImageUri
+          - Architecture
+          - MemorySize
+          - Timeout
+          - LogLevel
+          - LogRetentionInDays
+      - Label:
+          default: "Ingress & Security"
+        Parameters:
+          - AuthType
+          - EnableCors
+          - AllowedCorsOrigins
+      - Label:
+          default: "Connectors & Integration Credentials (Optional)"
+        Parameters:
+          - GitLabToken
+          - GitLabBaseUrl
+          - JiraUser
+          - JiraToken
+          - JiraBaseUrl
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment stage/environment name (e.g. dev, staging, prod).
+
+  ImageUri:
+    Type: String
+    Description: >
+      URI of the container image in Amazon ECR built with Dockerfile.lambda
+      (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/owlflow-lambda:latest).
+
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues:
+      - arm64
+      - x86_64
+    Description: CPU architecture matching your built container image.
+
+  MemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    MaxValue: 10240
+    Description: Amount of memory (in MB) allocated to the Lambda function.
+
+  Timeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 900
+    Description: Maximum execution duration (in seconds) per invocation.
+
+  LogLevel:
+    Type: String
+    Default: info
+    AllowedValues:
+      - debug
+      - info
+      - warn
+      - error
+    Description: Logging verbosity for the OwlFlow engine.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+    Description: Days to retain CloudWatch logs.
+
+  AuthType:
+    Type: String
+    Default: NONE
+    AllowedValues:
+      - NONE
+      - AWS_IAM
+    Description: >
+      Authentication method for Lambda Function URL.
+      Use NONE for webhook endpoints (GitLab, Jira, external services).
+      Use AWS_IAM to enforce SigV4 signatures.
+
+  EnableCors:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable Cross-Origin Resource Sharing (CORS) on Function URL.
+
+  AllowedCorsOrigins:
+    Type: CommaDelimitedList
+    Default: "*"
+    Description: Comma-delimited origins permitted when CORS is enabled (e.g., https://app.example.com or *).
+
+  GitLabToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional GitLab personal/project access token.
+
+  GitLabBaseUrl:
+    Type: String
+    Default: ""
+    Description: Optional self-hosted GitLab API URL (defaults to https://gitlab.com).
+
+  JiraUser:
+    Type: String
+    Default: ""
+    Description: Optional Jira Cloud account email.
+
+  JiraToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional Jira Cloud API token.
+
+  JiraBaseUrl:
+    Type: String
+    Default: ""
+    Description: Optional Jira Cloud URL (e.g., https://your-org.atlassian.net).
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  HasGitLabToken: !Not [!Equals [!Ref GitLabToken, ""]]
+  HasGitLabBaseUrl: !Not [!Equals [!Ref GitLabBaseUrl, ""]]
+  HasJiraUser: !Not [!Equals [!Ref JiraUser, ""]]
+  HasJiraToken: !Not [!Equals [!Ref JiraToken, ""]]
+  HasJiraBaseUrl: !Not [!Equals [!Ref JiraBaseUrl, ""]]
+  IsCorsEnabled: !Equals [!Ref EnableCors, "true"]
+  IsPublicAuth: !Equals [!Ref AuthType, "NONE"]
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ----------------------------------------------------------------------------
+  OwlFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/owlflow-${EnvironmentName}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ----------------------------------------------------------------------------
+  # IAM Execution Role
+  # ----------------------------------------------------------------------------
+  OwlFlowExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "owlflow-${EnvironmentName}-${AWS::Region}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OwlFlowLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/owlflow-${EnvironmentName}:*"
+
+  # ----------------------------------------------------------------------------
+  # Lambda Function (Container Image + AWS Lambda Web Adapter)
+  # ----------------------------------------------------------------------------
+  OwlFlowFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - OwlFlowLogGroup
+    Properties:
+      FunctionName: !Sub "owlflow-${EnvironmentName}"
+      Description: "OwlFlow Automation Engine serverless runtime"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Architectures:
+        - !Ref Architecture
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Role: !GetAtt OwlFlowExecutionRole.Arn
+      Environment:
+        Variables:
+          PORT: "8080"
+          AWS_LWA_INVOKE_MODE: "buffered"
+          LOG_LEVEL: !Ref LogLevel
+          GITLAB_TOKEN: !If [HasGitLabToken, !Ref GitLabToken, !Ref "AWS::NoValue"]
+          GITLAB_BASE_URL: !If [HasGitLabBaseUrl, !Ref GitLabBaseUrl, !Ref "AWS::NoValue"]
+          JIRA_USER: !If [HasJiraUser, !Ref JiraUser, !Ref "AWS::NoValue"]
+          JIRA_TOKEN: !If [HasJiraToken, !Ref JiraToken, !Ref "AWS::NoValue"]
+          JIRA_BASE_URL: !If [HasJiraBaseUrl, !Ref JiraBaseUrl, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Application
+          Value: OwlFlow
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------------------------
+  # Lambda Function URL (Ingress for Webhooks & API)
+  # ----------------------------------------------------------------------------
+  OwlFlowFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OwlFlowFunction.Arn
+      AuthType: !Ref AuthType
+      Cors:
+        !If
+          - IsCorsEnabled
+          - AllowOrigins: !Ref AllowedCorsOrigins
+            AllowMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            AllowHeaders:
+              - Content-Type
+              - Authorization
+              - X-Gitlab-Token
+              - X-Hub-Signature-256
+            MaxAge: 300
+          - !Ref "AWS::NoValue"
+
+  # ----------------------------------------------------------------------------
+  # Public Ingress Permission (Applied only when AuthType == NONE)
+  # ----------------------------------------------------------------------------
+  OwlFlowPublicUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPublicAuth
+    Properties:
+      FunctionName: !Ref OwlFlowFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  FunctionUrl:
+    Description: "Direct HTTPS endpoint for webhook ingress and API requests"
+    Value: !GetAtt OwlFlowFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionUrl"
+
+  FunctionArn:
+    Description: "ARN of the OwlFlow Lambda function"
+    Value: !GetAtt OwlFlowFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionArn"
+
+  FunctionName:
+    Description: "Name of the OwlFlow Lambda function"
+    Value: !Ref OwlFlowFunction
+
+  LogGroupName:
+    Description: "CloudWatch Log Group name"
+    Value: !Ref OwlFlowLogGroup
+
+  ExecutionRoleArn:
+    Description: "ARN of the IAM execution role"
+    Value: !GetAtt OwlFlowExecutionRole.Arn

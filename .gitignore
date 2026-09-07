@@ -1,0 +1,11 @@
+# Operating System
+.DS_Store
+Thumbs.db
+
+# CloudFormation packaged outputs
+*.packaged.yaml
+.aws-sam/
+
+# Temp files
+.tmp/
+*.log

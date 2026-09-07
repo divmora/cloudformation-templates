@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OwlFlow Automation Engine deployed as a container service on AWS ECS Fargate
+  for continuous cron scheduling, long-running workflows, and internal/external API ingress.
+
+# ==============================================================================
+# Metadata & Parameter Groups
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AssignPublicIp
+      - Label:
+          default: "Compute & Application Configuration"
+        Parameters:
+          - EnvironmentName
+          - ImageUri
+          - DesiredCount
+          - Cpu
+          - Memory
+          - Port
+          - LogLevel
+          - LogRetentionInDays
+      - Label:
+          default: "Connectors & Secrets (Optional)"
+        Parameters:
+          - GitLabToken
+          - GitLabBaseUrl
+          - JiraUser
+          - JiraToken
+          - JiraBaseUrl
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where ECS Fargate tasks will be placed.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of Subnet IDs (private or public) for Fargate task placement.
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Assign public IP to tasks (use ENABLED for public subnets without NAT, DISABLED for private subnets with NAT).
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment stage/environment name.
+
+  ImageUri:
+    Type: String
+    Description: ECR Image URI for OwlFlow (built from root Dockerfile).
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of concurrent OwlFlow engine tasks.
+
+  Cpu:
+    Type: String
+    Default: "256"
+    AllowedValues:
+      - "256"
+      - "512"
+      - "1024"
+      - "2048"
+    Description: Fargate task CPU allocation (256 = 0.25 vCPU, 512 = 0.5 vCPU, 1024 = 1 vCPU).
+
+  Memory:
+    Type: String
+    Default: "512"
+    AllowedValues:
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+    Description: Fargate task memory allocation in MB.
+
+  Port:
+    Type: Number
+    Default: 8080
+    Description: HTTP ingress port exposed by the OwlFlow container.
+
+  LogLevel:
+    Type: String
+    Default: info
+    AllowedValues:
+      - debug
+      - info
+      - warn
+      - error
+    Description: Logging level for OwlFlow.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+    Description: CloudWatch log retention period in days.
+
+  GitLabToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional GitLab personal/project access token.
+
+  GitLabBaseUrl:
+    Type: String
+    Default: ""
+    Description: Optional self-hosted GitLab URL.
+
+  JiraUser:
+    Type: String
+    Default: ""
+    Description: Optional Jira Cloud account email.
+
+  JiraToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional Jira Cloud API token.
+
+  JiraBaseUrl:
+    Type: String
+    Default: ""
+    Description: Optional Jira Cloud instance URL.
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  HasGitLabToken: !Not [!Equals [!Ref GitLabToken, ""]]
+  HasGitLabBaseUrl: !Not [!Equals [!Ref GitLabBaseUrl, ""]]
+  HasJiraUser: !Not [!Equals [!Ref JiraUser, ""]]
+  HasJiraToken: !Not [!Equals [!Ref JiraToken, ""]]
+  HasJiraBaseUrl: !Not [!Equals [!Ref JiraBaseUrl, ""]]
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ----------------------------------------------------------------------------
+  OwlFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/owlflow-${EnvironmentName}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ----------------------------------------------------------------------------
+  # ECS Cluster
+  # ----------------------------------------------------------------------------
+  OwlFlowCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "owlflow-cluster-${EnvironmentName}"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # ----------------------------------------------------------------------------
+  # Security Group
+  # ----------------------------------------------------------------------------
+  OwlFlowSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Security group for OwlFlow ${EnvironmentName} Fargate tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref Port
+          ToPort: !Ref Port
+          CidrIp: 0.0.0.0/0
+          Description: "Inbound traffic to OwlFlow REST API and webhooks"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Outbound access to external connectors (GitLab, Jira, Slack, HTTP)"
+
+  # ----------------------------------------------------------------------------
+  # IAM Roles
+  # ----------------------------------------------------------------------------
+  OwlFlowTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "owlflow-task-exec-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  OwlFlowTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "owlflow-task-${EnvironmentName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # ----------------------------------------------------------------------------
+  # ECS Task Definition
+  # ----------------------------------------------------------------------------
+  OwlFlowTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - OwlFlowLogGroup
+    Properties:
+      Family: !Sub "owlflow-${EnvironmentName}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt OwlFlowTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt OwlFlowTaskRole.Arn
+      ContainerDefinitions:
+        - Name: owlflow-server
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref Port
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OwlFlowLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: owlflow
+          Environment:
+            - Name: PORT
+              Value: !Sub "${Port}"
+            - Name: LOG_LEVEL
+              Value: !Ref LogLevel
+            - !If
+              - HasGitLabToken
+              - Name: GITLAB_TOKEN
+                Value: !Ref GitLabToken
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasGitLabBaseUrl
+              - Name: GITLAB_BASE_URL
+                Value: !Ref GitLabBaseUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasJiraUser
+              - Name: JIRA_USER
+                Value: !Ref JiraUser
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasJiraToken
+              - Name: JIRA_TOKEN
+                Value: !Ref JiraToken
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasJiraBaseUrl
+              - Name: JIRA_BASE_URL
+                Value: !Ref JiraBaseUrl
+              - !Ref "AWS::NoValue"
+
+  # ----------------------------------------------------------------------------
+  # ECS Service
+  # ----------------------------------------------------------------------------
+  OwlFlowService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "owlflow-${EnvironmentName}"
+      Cluster: !Ref OwlFlowCluster
+      TaskDefinition: !Ref OwlFlowTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref OwlFlowSecurityGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  ClusterName:
+    Description: "Name of the ECS Cluster"
+    Value: !Ref OwlFlowCluster
+
+  ServiceName:
+    Description: "Name of the ECS Service"
+    Value: !GetAtt OwlFlowService.Name
+
+  SecurityGroupId:
+    Description: "Security Group ID for OwlFlow tasks"
+    Value: !Ref OwlFlowSecurityGroup
+
+  LogGroupName:
+    Description: "CloudWatch Log Group name"
+    Value: !Ref OwlFlowLogGroup
+
+  TaskDefinitionArn:
+    Description: "ARN of the Task Definition"
+    Value: !Ref OwlFlowTaskDefinition
