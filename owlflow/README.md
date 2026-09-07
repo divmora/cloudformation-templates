@@ -8,7 +8,7 @@ This directory contains AWS CloudFormation templates for deploying **OwlFlow**, 
 
 | Architecture | Template | Recommended Use Case | Ingress | Cost Profile |
 | :--- | :--- | :--- | :--- | :--- |
-| **AWS Lambda** | [`owlflow-lambda.yaml`](./owlflow-lambda.yaml) | Webhook triggers (GitLab MRs, Jira comments, GitHub, HTTP), intermittent workloads | Direct HTTPS via **Lambda Function URL** | **Pay-per-request** ($0 at idle) |
+| **AWS Lambda** | [`owlflow-lambda.yaml`](./owlflow-lambda.yaml) | Webhook triggers (GitLab MRs, Jira comments, GitHub, HTTP), intermittent workloads | Direct HTTPS via **Lambda Function URL** (Supports VPC & Non-VPC) | **Pay-per-request** ($0 at idle) |
 | **ECS Fargate** | [`owlflow-ecs-fargate.yaml`](./owlflow-ecs-fargate.yaml) | Continuous sub-minute cron schedules, long-running daemons, high-frequency execution | Direct Public IP or Application Load Balancer | **Continuous baseline** (0.25 vCPU / 0.5 GB) |
 
 ---
@@ -17,12 +17,17 @@ This directory contains AWS CloudFormation templates for deploying **OwlFlow**, 
 
 Deploy OwlFlow as a containerized Lambda function powered by the **AWS Lambda Web Adapter**.
 
+### Ingress & VPC Modes:
+- **Lambda Function URL**: Provides a built-in HTTPS endpoint for receiving webhook payloads (from GitLab, Jira, GitHub) without paying for or managing an API Gateway or Application Load Balancer.
+- **VPC Deployment (Optional)**: If your workflows interact with private VPC resources (such as an internal GitLab instance, self-hosted Jira, internal databases, or private APIs), you can configure `VpcSubnetIds` and `VpcSecurityGroupIds`. When enabled, the template automatically provisions the `AWSLambdaVPCAccessExecutionRole` policy and sets up ENI attachments.
+  > **Note on Outbound Internet Egress**: When deploying inside a VPC, ensure target subnets route outbound 0.0.0.0/0 traffic through a NAT Gateway or configure VPC Endpoints for external SaaS services (e.g., gitlab.com, atlassian.net).
+
 ### Step 1: Build & Push Lambda Container Image
 
 Build using the dedicated `Dockerfile.lambda`:
 
 ```bash
-# Set your target AWS account, region, and ECR repository
+# Set target AWS account, region, and ECR repository
 export AWS_ACCOUNT_ID="123456789012"
 export AWS_REGION="us-east-1"
 export ECR_REPO="owlflow-lambda"
@@ -41,6 +46,7 @@ docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${
 
 ### Step 2: Deploy CloudFormation Stack
 
+#### Standard Deployment (Non-VPC):
 ```bash
 aws cloudformation deploy \
   --template-file owlflow/owlflow-lambda.yaml \
@@ -60,10 +66,29 @@ aws cloudformation deploy \
     JiraBaseUrl="https://your-org.atlassian.net"
 ```
 
+#### VPC Deployment (Private Subnets):
+```bash
+aws cloudformation deploy \
+  --template-file owlflow/owlflow-lambda.yaml \
+  --stack-name owlflow-lambda-vpc-prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    EnvironmentName=prod \
+    ImageUri=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG} \
+    VpcSubnetIds="subnet-0123456789abcdef0,subnet-0fedcba9876543210" \
+    VpcSecurityGroupIds="sg-0123456789abcdef0" \
+    Architecture=arm64 \
+    MemorySize=512 \
+    Timeout=60 \
+    LogLevel=info \
+    AuthType=NONE \
+    GitLabToken="glpat-xxxxxxxxxxxxxxxxxxxx"
+```
+
 ### Step 3: Retrieve Function URL & Verify Health
 
 ```bash
-# Get the public webhook ingress URL
+# Get the HTTPS webhook ingress URL
 FUNCTION_URL=$(aws cloudformation describe-stacks \
   --stack-name owlflow-lambda-prod \
   --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue" \
@@ -131,6 +156,8 @@ aws cloudformation deploy \
 | `AuthType` | `String` | `NONE` | Function URL authentication (`NONE` for public webhooks, `AWS_IAM` for SigV4) |
 | `EnableCors` | `String` | `true` | Enables CORS headers on Function URL |
 | `AllowedCorsOrigins` | `CommaDelimitedList` | `*` | Allowed CORS origins |
+| `VpcSubnetIds` | `CommaDelimitedList` | `""` | Optional comma-separated list of Subnet IDs for VPC connectivity |
+| `VpcSecurityGroupIds` | `CommaDelimitedList` | `""` | Optional comma-separated list of Security Group IDs for VPC connectivity |
 | `GitLabToken` | `String` | `""` | Optional GitLab personal access token (NoEcho) |
 | `GitLabBaseUrl` | `String` | `""` | Optional self-hosted GitLab URL |
 | `JiraUser` | `String` | `""` | Optional Jira Cloud account email |
@@ -144,4 +171,4 @@ aws cloudformation deploy \
 
 1. **Webhook Authentication**: When using `AuthType: NONE`, configure webhook secret verification in your workflow definitions (e.g. `trigger.secret` in OwlFlow workflows) to ensure incoming payloads are signed by GitLab / Jira / GitHub.
 2. **Secrets Protection**: Parameter values marked `NoEcho: true` are redacted from the AWS Console and CloudFormation events. For production systems, you can also inject AWS Secrets Manager references directly using dynamic parameters (`{{resolve:secretsmanager:...}}`).
-3. **Least Privilege**: IAM execution roles created by these templates restrict CloudWatch Logs writing strictly to the function's own dedicated log group.
+3. **Least Privilege**: IAM execution roles created by these templates restrict CloudWatch Logs writing strictly to the function's own dedicated log group, and VPC permissions are only attached when VPC subnets are provided.

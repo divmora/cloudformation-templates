@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   OwlFlow Automation Engine deployed as a serverless container image on AWS Lambda
-  using the AWS Lambda Web Adapter with public or IAM-authenticated Function URL ingress.
+  using the AWS Lambda Web Adapter with public or IAM-authenticated Function URL ingress,
+  and optional VPC connectivity.
 
 # ==============================================================================
 # Metadata & Parameter Groups
@@ -25,6 +26,11 @@ Metadata:
           - AuthType
           - EnableCors
           - AllowedCorsOrigins
+      - Label:
+          default: "VPC Configuration (Optional)"
+        Parameters:
+          - VpcSubnetIds
+          - VpcSecurityGroupIds
       - Label:
           default: "Connectors & Integration Credentials (Optional)"
         Parameters:
@@ -122,6 +128,21 @@ Parameters:
     Default: "*"
     Description: Comma-delimited origins permitted when CORS is enabled (e.g., https://app.example.com or *).
 
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of Subnet IDs (private subnets with NAT recommended)
+      if OwlFlow needs to access internal VPC resources (e.g., internal GitLab, databases).
+      Leave empty for non-VPC deployment.
+
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of Security Group IDs for VPC deployment.
+      Required if VpcSubnetIds is specified.
+
   GitLabToken:
     Type: String
     Default: ""
@@ -153,6 +174,7 @@ Parameters:
 # Conditions
 # ==============================================================================
 Conditions:
+  HasVpcConfig: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
   HasGitLabToken: !Not [!Equals [!Ref GitLabToken, ""]]
   HasGitLabBaseUrl: !Not [!Equals [!Ref GitLabBaseUrl, ""]]
   HasJiraUser: !Not [!Equals [!Ref JiraUser, ""]]
@@ -189,6 +211,11 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        !If
+          - HasVpcConfig
+          - - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+          - !Ref "AWS::NoValue"
       Policies:
         - PolicyName: OwlFlowLoggingPolicy
           PolicyDocument:
@@ -218,6 +245,12 @@ Resources:
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
       Role: !GetAtt OwlFlowExecutionRole.Arn
+      VpcConfig:
+        !If
+          - HasVpcConfig
+          - SubnetIds: !Ref VpcSubnetIds
+            SecurityGroupIds: !Ref VpcSecurityGroupIds
+          - !Ref "AWS::NoValue"
       Environment:
         Variables:
           PORT: "8080"
@@ -291,6 +324,10 @@ Outputs:
   FunctionName:
     Description: "Name of the OwlFlow Lambda function"
     Value: !Ref OwlFlowFunction
+
+  VpcEnabled:
+    Description: "Whether the function is deployed inside an Amazon VPC"
+    Value: !If [HasVpcConfig, "true", "false"]
 
   LogGroupName:
     Description: "CloudWatch Log Group name"
