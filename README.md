@@ -8,6 +8,7 @@ A curated catalog of production-ready AWS CloudFormation infrastructure-as-code 
 
 | Service / Workload | Directory | Supported Deployments | Description |
 | :--- | :--- | :--- | :--- |
+| **GitLab Fleet Governor** | [`gitlab-fleet-governor/`](./gitlab-fleet-governor/README.md) | AWS Lambda (Serverless), ECS Fargate | Declarative policy-as-code and compliance auditing engine for GitLab enterprise fleets. |
 | **OwlFlow** | [`owlflow/`](./owlflow/README.md) | AWS Lambda (Serverless), ECS Fargate | High-performance automation and workflow engine with webhook ingress and cron scheduling. |
 
 ---

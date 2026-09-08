@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitLab Fleet Governor automated policy governance and compliance auditing engine
+  deployed as a serverless container on AWS Lambda with EventBridge cron scheduling
+  and S3 policy triggers.
+
+# ==============================================================================
+# Metadata & Parameter Groups
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - EnvironmentName
+          - ImageUri
+          - Architecture
+          - MemorySize
+          - Timeout
+          - LogLevel
+          - LogRetentionInDays
+      - Label:
+          default: "Fleet Governance Configuration"
+        Parameters:
+          - ConfigSource
+          - DryRun
+          - Concurrency
+      - Label:
+          default: "GitLab Connection & Credentials"
+        Parameters:
+          - GitLabBaseUrl
+          - GitLabToken
+          - GitLabTokenSecretArn
+      - Label:
+          default: "EventBridge Scheduling"
+        Parameters:
+          - EnableSchedule
+          - ScheduleCron
+      - Label:
+          default: "VPC Configuration (Optional)"
+        Parameters:
+          - VpcSubnetIds
+          - VpcSecurityGroupIds
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment stage/environment name (e.g. dev, staging, prod).
+
+  ImageUri:
+    Type: String
+    Default: ghcr.io/divmora/gitlab-fleet-governor-lambda:latest
+    Description: >
+      URI of the container image in Amazon ECR or GitHub Container Registry built
+      with Dockerfile.lambda (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/gitlab-fleet-governor-lambda:latest).
+
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues:
+      - x86_64
+      - arm64
+    Description: Instruction set architecture for the Lambda function.
+
+  MemorySize:
+    Type: Number
+    Default: 1024
+    MinValue: 256
+    MaxValue: 10240
+    Description: Memory allocated to the Lambda function in megabytes.
+
+  Timeout:
+    Type: Number
+    Default: 900
+    MinValue: 30
+    MaxValue: 900
+    Description: Maximum function execution timeout in seconds (max 900s / 15 mins).
+
+  LogLevel:
+    Type: String
+    Default: info
+    AllowedValues:
+      - debug
+      - info
+      - warn
+      - error
+    Description: Logging severity level for the Governor engine.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: Number of days to retain CloudWatch logs.
+
+  ConfigSource:
+    Type: String
+    Default: s3://my-governance-policies/production.yaml
+    Description: >
+      Primary configuration source path or S3 URI (s3://bucket/key) containing the
+      declarative governance policy YAML/JSON.
+
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Run in simulation mode (true) or live mutating reconciliation (false).
+
+  Concurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum number of concurrent worker threads scanning GitLab projects.
+
+  GitLabBaseUrl:
+    Type: String
+    Default: https://gitlab.com/api/v4
+    Description: GitLab API base URL (e.g. https://gitlab.mycorp.com/api/v4).
+
+  GitLabToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Direct GitLab Personal Access Token or Group Access Token (scope: api or read_api).
+      Leave blank if referencing an existing AWS Secrets Manager secret via GitLabTokenSecretArn.
+
+  GitLabTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ARN of an existing AWS Secrets Manager secret storing the GitLab API token.
+      Recommended for production environments.
+
+  EnableSchedule:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable periodic EventBridge cron schedule execution.
+
+  ScheduleCron:
+    Type: String
+    Default: cron(0 2 * * ? *) # Daily at 02:00 AM UTC
+    Description: EventBridge cron expression for periodic governance runs.
+
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of VPC Subnet IDs if Lambda needs private network
+      access to a self-managed GitLab instance.
+
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Optional comma-separated list of Security Group IDs for VPC attachment.
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  HasVpc: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
+  HasTokenSecretArn: !Not [!Equals [!Ref GitLabTokenSecretArn, ""]]
+  HasDirectToken: !Not [!Equals [!Ref GitLabToken, ""]]
+  IsScheduleEnabled: !Equals [!Ref EnableSchedule, "true"]
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ----------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/gitlab-fleet-governor-${EnvironmentName}
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ----------------------------------------------------------------------------
+  # Dead Letter Queue (SQS)
+  # ----------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub gitlab-fleet-governor-dlq-${EnvironmentName}
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # ----------------------------------------------------------------------------
+  # IAM Execution Role
+  # ----------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub gitlab-fleet-governor-lambda-role-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - HasVpc
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: GovernorPolicyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3PolicyRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+              - Sid: SQSDeadLetterSend
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - !If
+                - HasTokenSecretArn
+                - Sid: SecretsManagerTokenRead
+                  Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref GitLabTokenSecretArn
+                - !Ref AWS::NoValue
+
+  # ----------------------------------------------------------------------------
+  # AWS Lambda Function (OCI Custom Container Runtime)
+  # ----------------------------------------------------------------------------
+  GovernorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaLogGroup
+    Properties:
+      FunctionName: !Sub gitlab-fleet-governor-${EnvironmentName}
+      Description: GitLab Fleet Governor declarative policy reconciliation and compliance audit engine
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Architectures:
+        - !Ref Architecture
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          CONFIG_SOURCE: !Ref ConfigSource
+          GITLAB_BASE_URL: !Ref GitLabBaseUrl
+          GITLAB_TOKEN: !If [HasDirectToken, !Ref GitLabToken, !Ref AWS::NoValue]
+          GITLAB_TOKEN_SECRET_ARN: !If [HasTokenSecretArn, !Ref GitLabTokenSecretArn, !Ref AWS::NoValue]
+          DRY_RUN: !Ref DryRun
+          CONCURRENCY: !Ref Concurrency
+          LOG_LEVEL: !Ref LogLevel
+          LOG_FORMAT: json
+      VpcConfig: !If
+        - HasVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: GitLab Fleet Governor
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------------------------
+  # EventBridge Scheduled Rule (Cron)
+  # ----------------------------------------------------------------------------
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: IsScheduleEnabled
+    Properties:
+      Name: !Sub gitlab-fleet-governor-schedule-${EnvironmentName}
+      Description: Periodic cron trigger for GitLab Fleet Governor reconciliation
+      ScheduleExpression: !Ref ScheduleCron
+      State: ENABLED
+      Targets:
+        - Id: GovernorLambdaTarget
+          Arn: !GetAtt GovernorFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsScheduleEnabled
+    Properties:
+      FunctionName: !Ref GovernorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Alarm: Lambda Invocations Errors
+  # ----------------------------------------------------------------------------
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub gitlab-fleet-governor-errors-${EnvironmentName}
+      AlarmDescription: Triggers when GitLab Fleet Governor Lambda execution encounters failures
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GovernorFunction
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  FunctionArn:
+    Description: ARN of the deployed GitLab Fleet Governor Lambda function
+    Value: !GetAtt GovernorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FunctionArn
+
+  FunctionName:
+    Description: Name of the deployed GitLab Fleet Governor Lambda function
+    Value: !Ref GovernorFunction
+
+  ScheduleRuleArn:
+    Condition: IsScheduleEnabled
+    Description: ARN of the EventBridge Cron schedule rule
+    Value: !GetAtt ScheduleRule.Arn
+
+  DeadLetterQueueUrl:
+    Description: URL of the Dead Letter SQS Queue
+    Value: !Ref DeadLetterQueue
+
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group
+    Value: !Ref LambdaLogGroup

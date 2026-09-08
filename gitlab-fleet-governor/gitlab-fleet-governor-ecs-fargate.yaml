@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitLab Fleet Governor automated policy governance and compliance auditing engine
+  deployed as a scheduled container task on AWS ECS Fargate for large-scale fleets
+  requiring runtimes beyond AWS Lambda's 15-minute execution limit.
+
+# ==============================================================================
+# Metadata & Parameter Groups
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AssignPublicIp
+          - SecurityGroupId
+      - Label:
+          default: "Compute & Application Configuration"
+        Parameters:
+          - EnvironmentName
+          - ImageUri
+          - Cpu
+          - Memory
+          - LogLevel
+          - LogRetentionInDays
+      - Label:
+          default: "Fleet Governance Configuration"
+        Parameters:
+          - CommandAction
+          - ConfigSource
+          - DryRun
+          - Concurrency
+      - Label:
+          default: "GitLab Connection & Credentials"
+        Parameters:
+          - GitLabBaseUrl
+          - GitLabToken
+          - GitLabTokenSecretArn
+      - Label:
+          default: "EventBridge Scheduling"
+        Parameters:
+          - EnableSchedule
+          - ScheduleCron
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where ECS Fargate tasks will be placed.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of Subnet IDs (private or public) for Fargate task placement.
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: >
+      Assign public IP to tasks (use ENABLED for public subnets without NAT Gateway,
+      DISABLED for private subnets with NAT Gateway).
+
+  SecurityGroupId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional existing Security Group ID. If left blank, a default outbound-only
+      Security Group will be automatically provisioned.
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment stage/environment name (e.g. dev, staging, prod).
+
+  ImageUri:
+    Type: String
+    Default: ghcr.io/divmora/gitlab-fleet-governor:latest
+    Description: >
+      URI of the container image in Amazon ECR or GitHub Container Registry
+      (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/gitlab-fleet-governor:latest).
+
+  Cpu:
+    Type: String
+    Default: "1024"
+    AllowedValues:
+      - "256"
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+    Description: Fargate CPU units (256 = 0.25 vCPU, 1024 = 1 vCPU, 2048 = 2 vCPUs).
+
+  Memory:
+    Type: String
+    Default: "2048"
+    AllowedValues:
+      - "512"
+      - "1024"
+      - "2048"
+      - "4096"
+      - "8192"
+    Description: Fargate Memory units in MB (1024 = 1 GB, 2048 = 2 GB, 4096 = 4 GB).
+
+  LogLevel:
+    Type: String
+    Default: info
+    AllowedValues:
+      - debug
+      - info
+      - warn
+      - error
+    Description: Logging severity level for the Governor engine.
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: Number of days to retain CloudWatch logs.
+
+  CommandAction:
+    Type: String
+    Default: run
+    AllowedValues:
+      - run
+      - audit
+    Description: >
+      Command action to execute on schedule: 'run' (governance reconciliation) or
+      'audit' (compliance & security posture audit).
+
+  ConfigSource:
+    Type: String
+    Default: s3://my-governance-policies/production.yaml
+    Description: >
+      Primary configuration source path or S3 URI (s3://bucket/key) containing the
+      declarative governance policy YAML/JSON.
+
+  DryRun:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Run in simulation mode (true) or live mutating reconciliation (false).
+
+  Concurrency:
+    Type: Number
+    Default: 16
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum number of concurrent worker threads scanning GitLab projects.
+
+  GitLabBaseUrl:
+    Type: String
+    Default: https://gitlab.com/api/v4
+    Description: GitLab API base URL (e.g. https://gitlab.mycorp.com/api/v4).
+
+  GitLabToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Direct GitLab Personal Access Token or Group Access Token (scope: api or read_api).
+      Leave blank if referencing an existing AWS Secrets Manager secret via GitLabTokenSecretArn.
+
+  GitLabTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ARN of an existing AWS Secrets Manager secret storing the GitLab API token.
+      Recommended for production environments.
+
+  EnableSchedule:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable periodic EventBridge cron schedule execution.
+
+  ScheduleCron:
+    Type: String
+    Default: cron(0 2 * * ? *) # Daily at 02:00 AM UTC
+    Description: EventBridge cron expression for periodic governance runs.
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  NeedsSecurityGroup: !Equals [!Ref SecurityGroupId, ""]
+  HasTokenSecretArn: !Not [!Equals [!Ref GitLabTokenSecretArn, ""]]
+  HasDirectToken: !Not [!Equals [!Ref GitLabToken, ""]]
+  IsScheduleEnabled: !Equals [!Ref EnableSchedule, "true"]
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # ECS Cluster
+  # ----------------------------------------------------------------------------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub gitlab-fleet-governor-cluster-${EnvironmentName}
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      Tags:
+        - Key: Project
+          Value: GitLab Fleet Governor
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ----------------------------------------------------------------------------
+  EcsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/gitlab-fleet-governor-${EnvironmentName}
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ----------------------------------------------------------------------------
+  # Security Group (Outbound Egress Only)
+  # ----------------------------------------------------------------------------
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: NeedsSecurityGroup
+    Properties:
+      GroupDescription: Outbound HTTPS egress for GitLab Fleet Governor Fargate tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS to GitLab API and AWS services
+      Tags:
+        - Key: Name
+          Value: !Sub gitlab-fleet-governor-sg-${EnvironmentName}
+        - Key: Project
+          Value: GitLab Fleet Governor
+
+  # ----------------------------------------------------------------------------
+  # IAM Execution Role (Fargate Agent: Pull Image, Logs, Decrypt Secrets)
+  # ----------------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub gitlab-fleet-governor-ecs-exec-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - !If
+          - HasTokenSecretArn
+          - PolicyName: SecretsManagerTokenRead
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: !Ref GitLabTokenSecretArn
+          - !Ref AWS::NoValue
+
+  # ----------------------------------------------------------------------------
+  # IAM Task Role (Governor Container: S3 Policy Read Access)
+  # ----------------------------------------------------------------------------
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub gitlab-fleet-governor-ecs-task-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3PolicyFileRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+
+  # ----------------------------------------------------------------------------
+  # IAM EventBridge Invocation Role (ecs:RunTask & iam:PassRole)
+  # ----------------------------------------------------------------------------
+  EventBridgeEcsRole:
+    Type: AWS::IAM::Role
+    Condition: IsScheduleEnabled
+    Properties:
+      RoleName: !Sub gitlab-fleet-governor-eventbridge-role-${EnvironmentName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunGovernorEcsTask
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Ref TaskDefinition
+                  - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/gitlab-fleet-governor-${EnvironmentName}:*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+  # ----------------------------------------------------------------------------
+  # ECS Task Definition (Fargate, Non-Root 10001)
+  # ----------------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub gitlab-fleet-governor-${EnvironmentName}
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: governor
+          Image: !Ref ImageUri
+          Essential: true
+          User: "10001:10001"
+          Command:
+            - !Ref CommandAction
+            - "--config"
+            - !Ref ConfigSource
+            - !Sub "--dry-run=${DryRun}"
+            - !Sub "--concurrency=${Concurrency}"
+            - "--log-format=json"
+            - "--report-format=json"
+          Environment:
+            - Name: GITLAB_BASE_URL
+              Value: !Ref GitLabBaseUrl
+            - Name: LOG_LEVEL
+              Value: !Ref LogLevel
+            - !If
+              - HasDirectToken
+              - Name: GITLAB_TOKEN
+                Value: !Ref GitLabToken
+              - !Ref AWS::NoValue
+          Secrets:
+            - !If
+              - HasTokenSecretArn
+              - Name: GITLAB_TOKEN
+                ValueFrom: !Ref GitLabTokenSecretArn
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: governor
+      Tags:
+        - Key: Project
+          Value: GitLab Fleet Governor
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------------------------
+  # EventBridge Scheduled Rule (Cron -> ECS RunTask)
+  # ----------------------------------------------------------------------------
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: IsScheduleEnabled
+    Properties:
+      Name: !Sub gitlab-fleet-governor-ecs-schedule-${EnvironmentName}
+      Description: Periodic cron trigger launching GitLab Fleet Governor ECS task
+      ScheduleExpression: !Ref ScheduleCron
+      State: ENABLED
+      Targets:
+        - Id: GovernorEcsTarget
+          Arn: !GetAtt EcsCluster.Arn
+          RoleArn: !GetAtt EventBridgeEcsRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref TaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets: !Ref SubnetIds
+                AssignPublicIp: !Ref AssignPublicIp
+                SecurityGroups:
+                  - !If
+                    - NeedsSecurityGroup
+                    - !GetAtt EcsSecurityGroup.GroupId
+                    - !Ref SecurityGroupId
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  ClusterArn:
+    Description: ARN of the deployed ECS Cluster
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterArn
+
+  ClusterName:
+    Description: Name of the deployed ECS Cluster
+    Value: !Ref EcsCluster
+
+  TaskDefinitionArn:
+    Description: ARN of the GitLab Fleet Governor ECS Task Definition
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${AWS::StackName}-TaskDefinitionArn
+
+  ScheduleRuleArn:
+    Condition: IsScheduleEnabled
+    Description: ARN of the EventBridge Cron schedule rule
+    Value: !GetAtt ScheduleRule.Arn
+
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group for task container logs
+    Value: !Ref EcsLogGroup
