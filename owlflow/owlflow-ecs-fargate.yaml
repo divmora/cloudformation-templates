@@ -241,8 +241,6 @@ Resources:
   # ----------------------------------------------------------------------------
   OwlFlowTaskDefinition:
     Type: AWS::ECS::TaskDefinition
-    DependsOn:
-      - OwlFlowLogGroup
     Properties:
       Family: !Sub "owlflow-${EnvironmentName}"
       NetworkMode: awsvpc
