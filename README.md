@@ -10,6 +10,7 @@ A curated catalog of production-ready AWS CloudFormation infrastructure-as-code 
 | :--- | :--- | :--- | :--- |
 | **GitLab Fleet Governor** | [`gitlab-fleet-governor/`](./gitlab-fleet-governor/README.md) | AWS Lambda (Serverless), ECS Fargate | Declarative policy-as-code and compliance auditing engine for GitLab enterprise fleets. |
 | **OwlFlow** | [`owlflow/`](./owlflow/README.md) | AWS Lambda (Serverless), ECS Fargate | High-performance automation and workflow engine with webhook ingress and cron scheduling. |
+| **AWS Log to OTel Processor** | [`otel-aws-log-processor/`](./otel-aws-log-processor/README.md) | AWS Lambda (Serverless) | Real-time processor converting AWS access logs (ALB, NLB, CloudFront, WAF) to OpenTelemetry OTLP format. |
 
 ---
 

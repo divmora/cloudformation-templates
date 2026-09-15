@@ -1,0 +1,135 @@
+# AWS Log to OpenTelemetry (OTLP) Processor CloudFormation Templates
+
+This directory contains production-ready AWS CloudFormation templates for deploying **`otel-aws-log-processor`**, a high-performance Go-based serverless Lambda application that parses and converts AWS access logs into OpenTelemetry (OTLP) log records, exporting them via HTTP to OTLP-compatible backends (SigNoz, OpenTelemetry Collector, Coralogix, Datadog).
+
+---
+
+## 🏛️ Deployment Architecture
+
+```mermaid
+flowchart LR
+    subgraph S3["1. Log Generation & Storage"]
+        ALB["Application Load Balancer (.log.gz)"] --> B1[(S3 Log Bucket)]
+        NLB["Network Load Balancer (.log.gz)"] --> B1
+        CF["CloudFront Access Logs (.gz, .parquet)"] --> B1
+        WAF["AWS WAF Access Logs (.json.gz)"] --> B1
+    end
+
+    subgraph Messaging["2. Event Notification"]
+        B1 -->|s3:ObjectCreated:*| SQS["SQS Ingestion Queue<br/>(Visibility: 180s)"]
+        SQS -.->|After 3 retries| DLQ["SQS Dead Letter Queue<br/>(Retention: 14 days)"]
+    end
+
+    subgraph Lambda["3. Serverless Processing (otel-aws-log-processor)"]
+        SQS -->|EventSourceMapping<br/>(Batch: 10, Concurrency: 10)| Func["AWS Lambda Function<br/>(arm64 Graviton / provided.al2023)"]
+        Func -->|s3:GetObject| B1
+    end
+
+    subgraph Backends["4. Observability Export"]
+        Func -->|HTTP POST /v1/logs<br/>(OTLP JSON with divmora.license.* tags)| OTLP["OTLP-Compatible Backend<br/>(SigNoz, OTel Collector, Datadog)"]
+    end
+```
+
+---
+
+## 📁 Template Overview
+
+| Template | Deployment Type | Recommended Use Case | Default Architecture |
+| :--- | :--- | :--- | :--- |
+| [`otel-aws-log-processor-lambda.yaml`](./otel-aws-log-processor-lambda.yaml) | **AWS Lambda (Serverless)** | Real-time S3 log ingestion for ALB, NLB, CloudFront, and WAF | `arm64` (AWS Graviton) |
+
+---
+
+## 🚀 Deployment Instructions
+
+### 1. Deploy with AWS CLI (Container Image via GHCR/ECR)
+
+```bash
+aws cloudformation deploy \
+  --template-file otel-aws-log-processor/otel-aws-log-processor-lambda.yaml \
+  --stack-name otel-aws-log-processor-prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    EnvironmentName=prod \
+    DeploymentType=Container \
+    ImageUri="ghcr.io/divmora/otel-aws-log-processor:latest" \
+    OtlpLogsEndpoint="https://otel.mycorp.internal/v1/logs" \
+    BasicAuthPasswordSecretArn="arn:aws:secretsmanager:us-east-1:123456789012:secret:otel-basic-auth" \
+    LogSourceBucketArns="arn:aws:s3:::my-alb-logs-bucket,arn:aws:s3:::my-waf-logs-bucket" \
+    DivmoraLicenseMode=warn
+```
+
+### 2. Deploy with AWS CLI (Static Binary Zip from S3)
+
+```bash
+# 1. Build and upload package to S3
+make lambda-package
+aws s3 cp lambda.zip s3://my-deploy-bucket/otel-aws-log-processor/lambda.zip
+
+# 2. Deploy CloudFormation stack
+aws cloudformation deploy \
+  --template-file otel-aws-log-processor/otel-aws-log-processor-lambda.yaml \
+  --stack-name otel-aws-log-processor-prod \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    EnvironmentName=prod \
+    DeploymentType=Zip \
+    CodeS3Bucket="my-deploy-bucket" \
+    CodeS3Key="otel-aws-log-processor/lambda.zip" \
+    OtlpLogsEndpoint="https://otel.mycorp.internal/v1/logs" \
+    LogSourceBucketArns="arn:aws:s3:::my-alb-logs-bucket" \
+    DivmoraLicenseMode=warn
+```
+
+---
+
+## 🔗 Configuring S3 Bucket Notifications
+
+Once the CloudFormation stack completes, retrieve the SQS Ingestion Queue ARN from the stack outputs:
+
+```bash
+QUEUE_ARN=$(aws cloudformation describe-stacks \
+  --stack-name otel-aws-log-processor-prod \
+  --query "Stacks[0].Outputs[?OutputKey=='IngestionQueueArn'].OutputValue" \
+  --output text)
+```
+
+Configure your S3 log bucket to notify the SQS queue when logs arrive:
+
+```bash
+aws s3api put-bucket-notification-configuration \
+  --bucket my-alb-logs-bucket \
+  --notification-configuration '{
+    "QueueConfigurations": [
+      {
+        "QueueArn": "'"${QUEUE_ARN}"'",
+        "Events": ["s3:ObjectCreated:*"]
+      }
+    ]
+  }'
+```
+
+---
+
+## ⚙️ CloudFormation Parameters Reference
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `EnvironmentName` | String | `prod` | Deployment environment name (`dev`, `staging`, `prod`). |
+| `DeploymentType` | String | `Container` | `Container` (OCI image) or `Zip` (static binary from S3). |
+| `ImageUri` | String | `ghcr.io/divmora/...` | OCI image URI in ECR or GHCR. |
+| `Architecture` | String | `arm64` | `arm64` (AWS Graviton) or `x86_64`. |
+| `MemorySize` | Number | `512` | Memory allocated to Lambda in MB. |
+| `Timeout` | Number | `120` | Lambda execution timeout in seconds. |
+| `OtlpLogsEndpoint` | String | `http://...` | Outbound HTTP endpoint for OTLP logs. |
+| `BasicAuthUsername` | String | `""` | Optional HTTP basic auth username. |
+| `BasicAuthPasswordSecretArn` | String | `""` | Optional Secrets Manager secret ARN for OTLP basic auth password. |
+| `MaxBatchSize` | Number | `500` | Max OTel log records per outbound HTTP request. |
+| `MaxConcurrent` | Number | `10` | Max concurrent log file parsers and HTTP sender routines. |
+| `DivmoraLicenseKey` | String | `""` | Optional commercial license key (free for non-prod). |
+| `DivmoraLicenseMode` | String | `warn` | `warn` (emit metrics and notices) or `strict` (terminate if unlicensed). |
+| `LogSourceBucketArns` | CommaDelimitedList | `arn:aws:s3:::*` | S3 bucket ARNs containing log archives to grant Lambda read access. |
+| `SqsBatchSize` | Number | `10` | Max SQS messages delivered to Lambda per invocation batch. |
+| `SqsMaximumConcurrency` | Number | `10` | Maximum concurrent Lambda invocations triggered by SQS. |
+| `VpcSubnetIds` | CommaDelimitedList | `""` | Optional VPC subnets if collector is private. |
+| `VpcSecurityGroupIds` | CommaDelimitedList | `""` | Optional Security Group IDs for Lambda VPC attachment. |
