@@ -111,6 +111,102 @@ aws s3api put-bucket-notification-configuration \
 
 ---
 
+---
+
+## 🌐 Multi-Bucket & Cross-Account EventBridge Architecture
+
+When your workload resources (ALBs, NLBs, CloudFront, WAF) write logs to **multiple S3 buckets across multiple AWS accounts**, you can stream them all to a single central `otel-aws-log-processor` instance deployed in a **Central Observability Account**.
+
+```mermaid
+flowchart TD
+    subgraph AccA["Account A: Workload 1 (111122223333)"]
+        ALB["Application Load Balancer"] --> BucketA[("S3: app1-alb-logs")]
+        BucketA -->|EventBridge Notification| EBA["EventBridge Rule"]
+        EBA -->|Cross-Account Target| SQS
+    end
+
+    subgraph AccB["Account B: Workload 2 (222233334444)"]
+        WAF["AWS WAF Logs"] --> BucketB[("S3: app2-waf-logs")]
+        BucketB -->|EventBridge Notification| EBB["EventBridge Rule"]
+        EBB -->|Cross-Account Target| SQS
+    end
+
+    subgraph Central["Central Observability Account (999999999999)"]
+        SQS[("Amazon SQS Ingestion Queue")] --> Lambda["AWS Lambda Engine<br/>(otel-aws-log-processor)"]
+        Lambda -->|s3:GetObject| BucketA
+        Lambda -->|s3:GetObject| BucketB
+        Lambda -->|HTTP/OTLP| OTel["OTel Collector / SigNoz / Datadog"]
+    end
+```
+
+### 1. Deploy Central Stack with Cross-Account Permissions
+
+Deploy the stack in your **Central Observability Account**, specifying which external accounts or AWS Organization can send events to the queue:
+
+```bash
+aws cloudformation deploy \
+  --template-file otel-aws-log-processor/otel-aws-log-processor-lambda.yaml \
+  --stack-name otel-aws-log-processor-central \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    EnvironmentName=prod \
+    OtlpLogsEndpoint="https://otel.mycorp.internal/v1/logs" \
+    AllowedSourceAccountIds="111122223333,222233334444" \
+    OrganizationId="o-abcdef1234" \
+    LogSourceBucketArns="arn:aws:s3:::app1-alb-logs,arn:aws:s3:::app1-alb-logs/*,arn:aws:s3:::app2-waf-logs,arn:aws:s3:::app2-waf-logs/*"
+```
+
+### 2. Configure Source Workload Accounts (Account A, Account B)
+
+In each external source account:
+
+1. **Enable EventBridge on the S3 bucket**:
+   ```bash
+   aws s3api put-bucket-notification-configuration \
+     --bucket app1-alb-logs \
+     --notification-configuration '{"EventBridgeConfiguration": {}}'
+   ```
+
+2. **Add Bucket Policy** permitting the central Lambda execution role to read log files:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "AllowCentralLogProcessorRead",
+         "Effect": "Allow",
+         "Principal": {
+           "AWS": "arn:aws:iam::999999999999:role/otel-aws-log-processor-role-prod"
+         },
+         "Action": ["s3:GetObject", "s3:ListBucket"],
+         "Resource": [
+           "arn:aws:s3:::app1-alb-logs",
+           "arn:aws:s3:::app1-alb-logs/*"
+         ]
+       }
+     ]
+   }
+   ```
+
+3. **Deploy an EventBridge Rule** in the source account forwarding S3 `Object Created` events to the central SQS queue:
+   ```yaml
+   Type: AWS::Events::Rule
+   Properties:
+     Description: Forward S3 access log events to Central SQS queue
+     EventPattern:
+       source: ["aws.s3"]
+       detail-type: ["Object Created"]
+       detail:
+         bucket:
+           name: ["app1-alb-logs"]
+     State: ENABLED
+     Targets:
+       - Id: CentralSqsTarget
+         Arn: "arn:aws:sqs:us-east-1:999999999999:otel-aws-log-processor-queue-prod"
+   ```
+
+---
+
 ## ⚙️ CloudFormation Parameters Reference
 
 | Parameter | Type | Default | Description |
@@ -128,7 +224,10 @@ aws s3api put-bucket-notification-configuration \
 | `MaxConcurrent` | Number | `10` | Max concurrent log file parsers and HTTP sender routines. |
 | `DivmoraLicenseKey` | String | `""` | Optional commercial license key (free for non-prod). |
 | `DivmoraLicenseMode` | String | `warn` | `warn` (emit metrics and notices) or `strict` (terminate if unlicensed). |
-| `LogSourceBucketArns` | CommaDelimitedList | `arn:aws:s3:::*` | S3 bucket ARNs containing log archives to grant Lambda read access. |
+| `LogSourceBucketArns` | CommaDelimitedList | `*` | Comma-separated list of S3 bucket ARNs containing log archives to grant Lambda read access. |
+| `AllowedSourceAccountIds` | CommaDelimitedList | `""` | Optional list of external AWS Account IDs permitted to publish cross-account EventBridge events to SQS. |
+| `OrganizationId` | String | `""` | Optional AWS Organization ID (`o-xxxxxxxxx`) to allow all accounts in the organization to publish to SQS. |
+| `LogSourceKmsKeyArns` | CommaDelimitedList | `""` | Optional list of KMS Key ARNs for decrypting external SSE-KMS encrypted S3 log buckets. |
 | `SqsBatchSize` | Number | `10` | Max SQS messages delivered to Lambda per invocation batch. |
 | `SqsMaximumConcurrency` | Number | `10` | Maximum concurrent Lambda invocations triggered by SQS. |
 | `VpcSubnetIds` | CommaDelimitedList | `""` | Optional VPC subnets if collector is private. |

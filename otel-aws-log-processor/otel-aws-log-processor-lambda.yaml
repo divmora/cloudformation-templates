@@ -40,7 +40,10 @@ Metadata:
       - Label:
           default: "Log Source & Ingestion Queue"
         Parameters:
-          - LogSourceBucketArn
+          - LogSourceBucketArns
+          - AllowedSourceAccountIds
+          - OrganizationId
+          - LogSourceKmsKeyArns
           - SqsVisibilityTimeout
           - SqsBatchSize
           - SqsBatchingWindow
@@ -184,11 +187,33 @@ Parameters:
     Description: >
       Optional cryptographic release provenance attestation token for Layer 3 BSL 1.1 defense.
 
-  LogSourceBucketArn:
-    Type: String
+  LogSourceBucketArns:
+    Type: CommaDelimitedList
     Default: "*"
     Description: >
-      S3 bucket ARN pattern containing access logs to grant Lambda read access (e.g. 'arn:aws:s3:::my-alb-logs' or '*').
+      Comma-separated list of S3 bucket ARN patterns containing access logs to grant Lambda read access
+      (e.g. 'arn:aws:s3:::app1-logs,arn:aws:s3:::app2-logs' or '*').
+
+  AllowedSourceAccountIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of external AWS Account IDs permitted to publish EventBridge
+      log notifications to the SQS Ingestion Queue across accounts.
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional AWS Organization ID (e.g. 'o-abcdef1234'). When specified, permits ALL accounts
+      within the AWS Organization to publish EventBridge log notifications to the SQS Ingestion Queue.
+
+  LogSourceKmsKeyArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional comma-separated list of KMS Key ARNs used to encrypt S3 log buckets in external
+      source accounts (grants kms:Decrypt to the Lambda execution role).
 
   SqsVisibilityTimeout:
     Type: Number
@@ -244,7 +269,10 @@ Conditions:
   HasLicenseSecret: !Not [!Equals [!Ref DivmoraLicenseKeySecretArn, ""]]
   HasDirectBasicAuthPassword: !Not [!Equals [!Ref BasicAuthPassword, ""]]
   HasDirectLicenseKey: !Not [!Equals [!Ref DivmoraLicenseKey, ""]]
-  HasSpecificBucket: !Not [!Or [!Equals [!Ref LogSourceBucketArn, "*"], !Equals [!Ref LogSourceBucketArn, ""]]]
+  HasAllowedSourceAccounts: !Not [!Equals [!Join ["", !Ref AllowedSourceAccountIds], ""]]
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, ""]]
+  HasLogSourceKmsKeys: !Not [!Equals [!Join ["", !Ref LogSourceKmsKeyArns], ""]]
+  HasWildcardBucket: !Equals [!Join ["", !Ref LogSourceBucketArns], "*"]
 
 # ==============================================================================
 # Resources
@@ -286,20 +314,41 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: AllowS3AndEventBridgeSend
+          - Sid: AllowSameAccountS3AndEventBridgeSend
             Effect: Allow
             Principal:
               Service:
                 - s3.amazonaws.com
                 - events.amazonaws.com
-            Action:
-              - sqs:SendMessage
+            Action: sqs:SendMessage
             Resource: !GetAtt IngestionQueue.Arn
-            Condition: !If
-              - HasSpecificBucket
-              - ArnLike:
-                  aws:SourceArn: !Ref LogSourceBucketArn
-              - !Ref AWS::NoValue
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - !If
+            - HasAllowedSourceAccounts
+            - Sid: AllowCrossAccountEventBridgeAccounts
+              Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt IngestionQueue.Arn
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref AllowedSourceAccountIds
+            - !Ref AWS::NoValue
+          - !If
+            - HasOrganizationId
+            - Sid: AllowAllAccountsInOrganization
+              Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt IngestionQueue.Arn
+              Condition:
+                StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+            - !Ref AWS::NoValue
 
   # ----------------------------------------------------------------------------
   # CloudWatch Log Group
@@ -352,10 +401,22 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                 Resource: !If
-                  - HasSpecificBucket
-                  - - !Ref LogSourceBucketArn
-                    - !Sub "${LogSourceBucketArn}/*"
-                  - - "*"
+                  - HasWildcardBucket
+                  - - "arn:aws:s3:::*"
+                    - "arn:aws:s3:::*/*"
+                  - !Ref LogSourceBucketArns
+        - !If
+          - HasLogSourceKmsKeys
+          - PolicyName: KmsLogDecryptionPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref LogSourceKmsKeyArns
+          - !Ref AWS::NoValue
         - !If
           - HasBasicAuthSecret
           - PolicyName: BasicAuthSecretReadPolicy
