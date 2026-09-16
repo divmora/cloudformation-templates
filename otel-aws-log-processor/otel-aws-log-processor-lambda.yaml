@@ -289,7 +289,7 @@ Resources:
     Properties:
       QueueName: !Sub otel-aws-log-processor-dlq-${EnvironmentName}
       MessageRetentionPeriod: 1209600 # 14 days
-      KmsMasterKeyId: alias/aws/sqs
+      SqsManagedSseEnabled: true
 
   # ----------------------------------------------------------------------------
   # SQS Ingestion Queue (Receives S3 ObjectCreated Notifications)
@@ -300,7 +300,7 @@ Resources:
       QueueName: !Sub otel-aws-log-processor-queue-${EnvironmentName}
       VisibilityTimeout: !Ref SqsVisibilityTimeout
       MessageRetentionPeriod: 345600 # 4 days
-      KmsMasterKeyId: alias/aws/sqs
+      SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
         maxReceiveCount: !Ref SqsMaxReceiveCount
