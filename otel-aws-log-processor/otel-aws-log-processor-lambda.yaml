@@ -393,7 +393,6 @@ Resources:
                   - sqs:ChangeMessageVisibility
                 Resource:
                   - !GetAtt IngestionQueue.Arn
-                  - !GetAtt DeadLetterQueue.Arn
         - PolicyName: S3LogBucketAccessPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -457,8 +456,6 @@ Resources:
         - !Ref Architecture
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
-      DeadLetterConfig:
-        TargetArn: !GetAtt DeadLetterQueue.Arn
       Environment:
         Variables:
           ENVIRONMENT: !Ref EnvironmentName
