@@ -83,7 +83,9 @@ Parameters:
       - x86_64
     Description: >
       CPU instruction set architecture. 'arm64' (AWS Graviton) is recommended for best
-      price-to-performance and throughput.
+      price-to-performance and throughput with official multi-arch images. If deploying
+      a custom single-arch container image built on x86 CI runners, set this to 'x86_64'
+      to prevent 'Runtime.InvalidEntrypoint' errors.
 
   MemorySize:
     Type: Number

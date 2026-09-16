@@ -232,3 +232,40 @@ In each external source account:
 | `SqsMaximumConcurrency` | Number | `10` | Maximum concurrent Lambda invocations triggered by SQS. |
 | `VpcSubnetIds` | CommaDelimitedList | `""` | Optional VPC subnets if collector is private. |
 | `VpcSecurityGroupIds` | CommaDelimitedList | `""` | Optional Security Group IDs for Lambda VPC attachment. |
+
+---
+
+## 🔧 Troubleshooting
+
+### `Status: error, Error Type: Runtime.InvalidEntrypoint`
+
+**Cause:**
+This error occurs when AWS Lambda is configured to run on one CPU architecture (e.g., `arm64` Graviton), but the container image provided contains a binary compiled for a different architecture (e.g., `x86_64` / `amd64`).
+
+- The template's `Architecture` parameter defaults to `arm64` (AWS Graviton) for best price-to-performance.
+- The official image (`ghcr.io/divmora/otel-aws-log-processor:latest`) is published as a multi-arch index supporting both `linux/amd64` and `linux/arm64`.
+- If you build a **custom container image** on standard x86 CI runners (e.g., GitHub Actions `ubuntu-latest`) without multi-arch tooling, Docker produces an `amd64` image. When deployed with the default `arm64` setting, Lambda fails to execute the entrypoint binary.
+
+**Remediation:**
+
+1. **Override `Architecture` in CloudFormation:**
+   Set `Architecture=x86_64` when deploying your custom image:
+   ```bash
+   aws cloudformation deploy \
+     --template-file otel-aws-log-processor/otel-aws-log-processor-lambda.yaml \
+     --stack-name otel-aws-log-processor-prod \
+     --capabilities CAPABILITY_NAMED_IAM \
+     --parameter-overrides \
+       ImageUri="123456789012.dkr.ecr.us-east-1.amazonaws.com/my-custom-image:latest" \
+       Architecture=x86_64
+   ```
+
+2. **Build Multi-Arch Container Images:**
+   Use Docker Buildx with QEMU in your CI pipeline to produce multi-architecture manifests:
+   ```bash
+   docker buildx build \
+     --platform linux/amd64,linux/arm64 \
+     -t 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-custom-image:latest \
+     --push .
+   ```
+
