@@ -36,6 +36,8 @@ Metadata:
           - DivmoraLicenseKey
           - DivmoraLicenseKeySecretArn
           - DivmoraLicenseMode
+          - DivmoraLicenseFailureAction
+          - DivmoraCrlUrl
           - DivmoraReleaseSignature
       - Label:
           default: "Log Source & Ingestion Queue"
@@ -182,6 +184,24 @@ Parameters:
     Description: >
       Enforcement mode: 'warn' logs compliance notices and emits CloudWatch EMF metrics without blocking;
       'strict' terminates processing if commercial license is missing or expired in production.
+
+  DivmoraLicenseFailureAction:
+    Type: String
+    Default: discard
+    AllowedValues:
+      - discard
+      - dlq
+    Description: >
+      Action to take on deterministic licensing compliance failures in strict mode:
+      'discard' acknowledges and deletes the SQS messages to suppress infinite retry billing storms;
+      'dlq' routes failed messages to the Dead Letter Queue without crashing the Lambda execution container.
+
+  DivmoraCrlUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Optional HTTPS URL for online Certificate Revocation List (CRL) synchronization
+      (e.g., 'https://crl.divmora.com/otel-aws-log-processor.crl').
 
   DivmoraReleaseSignature:
     Type: String
@@ -474,6 +494,8 @@ Resources:
             - !Sub "{{resolve:secretsmanager:${DivmoraLicenseKeySecretArn}:SecretString}}"
             - !If [HasDirectLicenseKey, !Ref DivmoraLicenseKey, ""]
           DIVMORA_LICENSE_MODE: !Ref DivmoraLicenseMode
+          DIVMORA_LICENSE_FAILURE_ACTION: !Ref DivmoraLicenseFailureAction
+          DIVMORA_CRL_URL: !Ref DivmoraCrlUrl
           DIVMORA_RELEASE_SIGNATURE: !Ref DivmoraReleaseSignature
       VpcConfig: !If
         - HasVpc
@@ -535,10 +557,36 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
 
+  # ----------------------------------------------------------------------------
+  # CloudWatch Alarm: License Compliance Violations
+  # ----------------------------------------------------------------------------
+  LicenseViolationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub otel-aws-log-processor-license-violations-${EnvironmentName}
+      AlarmDescription: Triggers when deterministic license compliance violations occur in production
+      Namespace: Divmora/LogProcessor
+      MetricName: LicenseViolations
+      Dimensions:
+        - Name: Environment
+          Value: !Ref EnvironmentName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
 # ==============================================================================
 # Outputs
 # ==============================================================================
 Outputs:
+  LicenseViolationAlarmArn:
+    Description: ARN of the License Compliance Violations CloudWatch Alarm
+    Value: !GetAtt LicenseViolationAlarm.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LicenseViolationAlarmArn
+
   LambdaFunctionArn:
     Description: ARN of the deployed log processor Lambda function
     Value: !GetAtt LambdaFunction.Arn

@@ -224,6 +224,8 @@ In each external source account:
 | `MaxConcurrent` | Number | `10` | Max concurrent log file parsers and HTTP sender routines. |
 | `DivmoraLicenseKey` | String | `""` | Optional commercial license key (free for non-prod). |
 | `DivmoraLicenseMode` | String | `warn` | `warn` (emit metrics and notices) or `strict` (terminate if unlicensed). |
+| `DivmoraLicenseFailureAction` | String | `discard` | Behavior on deterministic license compliance failure in strict mode (`discard` drops messages to prevent SQS ESM retry billing storms, `dlq` routes directly to DLQ). |
+| `DivmoraCrlUrl` | String | `""` | Optional HTTPS URL for online Certificate Revocation List (CRL) distribution synchronization. |
 | `LogSourceBucketArns` | CommaDelimitedList | `*` | Comma-separated list of S3 bucket ARNs containing log archives to grant Lambda read access. |
 | `AllowedSourceAccountIds` | CommaDelimitedList | `""` | Optional list of external AWS Account IDs permitted to publish cross-account EventBridge events to SQS. |
 | `OrganizationId` | String | `""` | Optional AWS Organization ID (`o-xxxxxxxxx`) to allow all accounts in the organization to publish to SQS. |
@@ -232,6 +234,24 @@ In each external source account:
 | `SqsMaximumConcurrency` | Number | `10` | Maximum concurrent Lambda invocations triggered by SQS. |
 | `VpcSubnetIds` | CommaDelimitedList | `""` | Optional VPC subnets if collector is private. |
 | `VpcSecurityGroupIds` | CommaDelimitedList | `""` | Optional Security Group IDs for Lambda VPC attachment. |
+
+---
+
+## 📊 Observability & Automated CloudWatch Alarms
+
+The stack provisions automated CloudWatch alarms to provide real-time operational visibility:
+
+| Alarm | Metric & Dimension | Threshold | Description |
+| :--- | :--- | :--- | :--- |
+| **`DeadLetterQueueAlarm`** | `AWS/SQS` `ApproximateNumberOfMessagesVisible` | `>= 1` for 5 min | Triggers when failed messages accumulate in the DLQ. |
+| **`LambdaErrorAlarm`** | `AWS/Lambda` `Errors` | `>= 1` for 5 min | Triggers when Lambda produces unhandled runtime crashes. |
+| **`LicenseViolationAlarm`** | `Divmora/LogProcessor` `LicenseViolations` (`Environment`) | `>= 1` for 5 min | Triggers when deterministic license compliance violations occur via CloudWatch Embedded Metric Format (EMF). |
+
+### Serverless SQS Retry Loop Prevention
+When running with `DivmoraLicenseMode=strict`:
+- Deterministic compliance failures (unlicensed production, expired token, revoked token, account mismatch, or unentitled feature) are intercepted prior to downloading large S3 files.
+- `DivmoraLicenseFailureAction=discard` (default): Acknowledges and drops messages cleanly, suppressing infinite SQS ESM retry storms and billing inflation.
+- `DivmoraLicenseFailureAction=dlq`: Records failed items in `BatchItemFailures`, routing messages directly to the Dead Letter Queue without container crashes.
 
 ---
 
