@@ -8,7 +8,7 @@ A curated catalog of production-ready AWS CloudFormation infrastructure-as-code 
 
 | Service / Workload | Directory | Supported Deployments | Description |
 | :--- | :--- | :--- | :--- |
-| **OwlFlow** | [`owlflow/`](./owlflow/README.md) | AWS Lambda (Serverless), ECS Fargate | High-performance automation and workflow engine with webhook ingress and cron scheduling. |
+| _No workloads registered._ | | | _Templates will be added as services are onboarded._ |
 
 ---
 
